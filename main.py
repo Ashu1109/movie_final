@@ -17,6 +17,7 @@ from moviepy.editor import (
 )
 from upload_google import upload_video
 
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -45,6 +46,82 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+import os
+import subprocess
+
+
+def add_subtitle_to_video(video_path, request_temp_dir, merge_data):
+    """
+    Add subtitle to a video using FFmpeg.
+
+    :param video_path: Path to the input video file
+    :param request_temp_dir: Directory to store temporary files
+    :param merge_data: Dictionary containing subtitle properties
+    :return: Path to the output video with subtitles
+    """
+
+    # Verify that the video file exists
+    if not os.path.exists(video_path):
+        print(f"Error: Video file '{video_path}' not found.")
+        return None
+
+    # Ensure the temp directory exists
+    if not os.path.exists(request_temp_dir):
+        os.makedirs(request_temp_dir)
+
+    subtitle_file = os.path.join(request_temp_dir, "subtitle.srt")
+
+    # Create SRT file with subtitles, breaking the subtitle_text into parts
+    if "subtitle_text" in merge_data and merge_data["subtitle_text"]:
+        # Split the subtitle_text by periods to create separate sentences
+        raw_subtitles = merge_data["subtitle_text"].split(".")
+        # Clean up the sentences and remove empty ones
+        subtitles = [subtitle.strip() for subtitle in raw_subtitles if subtitle.strip()]
+        # Add periods back to the end of each subtitle if not already present
+        subtitles = [
+            subtitle + "." if not subtitle.endswith(".") else subtitle
+            for subtitle in subtitles
+        ]
+    else:
+        # Fallback to default subtitles if no subtitle_text is provided
+        subtitles = [
+            "Embark on a journey of timeless wisdom.",
+            "From ancient Greece to modern life.",
+            "In the shadow of Titans, we discover eternal truths etched in marble.",
+            "Through ancient eyes, we see the present anew, a canvas of choices and change.",
+            "The gods whisper through marble, guiding us toward unyielding resolve amid chaos.",
+            "In contemplation, find the courage to act; in action, find the peace of mind.",
+            "These lessons endure as marble, teaching us strength, patience, and enduring wisdom.",
+        ]
+
+    with open(subtitle_file, "w") as f:
+        for i, subtitle in enumerate(subtitles):
+            start_time = f"00:00:{i*5:02},000"
+            end_time = f"00:00:{(i+1)*5:02},000"
+            f.write(f"{i+1}\n{start_time} --> {end_time}\n{subtitle}\n\n")
+
+    # Add subtitle to video using FFmpeg
+    output_video_with_subtitle = os.path.join(
+        request_temp_dir, "video_with_subtitle.mp4"
+    )
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-i",
+        video_path,
+        "-vf",
+        f"subtitles={subtitle_file}:force_style='Fontsize={merge_data['subtitle_font_size']},Alignment=10,PrimaryColour=&HFFFFFF,Outline=1,Shadow=0,MarginV=0,MarginL=0,MarginR=0,Bold=1'",
+        "-c:v",
+        "libx264",
+        output_video_with_subtitle,
+    ]
+
+    try:
+        subprocess.run(ffmpeg_cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to add subtitle: {e}")
+        return None
+
+    return output_video_with_subtitle
 
 
 class MergeRequest(BaseModel):
@@ -52,6 +129,9 @@ class MergeRequest(BaseModel):
     background_audio_url: Optional[str] = None
     background_volume: Optional[float] = 0.5
     upload_to_drive: Optional[bool] = False
+    subtitle_text: Optional[str] = None
+    subtitle_font_size: Optional[int] = 24
+    subtitle_color: Optional[str] = "white"
 
 
 def download_file(url, output_path):
@@ -232,29 +312,92 @@ def cleanup_all_temp_output():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+class MergeVideoRequest(BaseModel):
+    video_urls: List[str]
+    background_audio_url: Optional[str] = None
+    background_volume: Optional[float] = 0.5
+    upload_to_drive: Optional[bool] = False
+    subtitle_data: Optional[dict] = {
+        "subtitle_text": "",
+        "subtitle_font_size": 24,
+        "subtitle_color": "white",
+    }
+
+
 @app.post("/merge")
 async def merge_videos(
     background_tasks: BackgroundTasks,
-    merge_request: str = Form(...),
-    narration_file: UploadFile = File(None),
-    upload_to_drive: str = Form(None),
+    request: MergeVideoRequest,
+    narration_file: UploadFile = None,
 ):
-    logger.info("Merge endpoint accessed")
-    # Parse the merge request JSON
-    logger.info(f"Received merge_request: {merge_request}")
-    logger.info(f"Received upload_to_drive: {upload_to_drive}")
-    request_data = json.loads(merge_request)
-    merge_data = MergeRequest(**request_data)
+    """Endpoint for JSON requests without file uploads"""
+    return await process_merge_request(background_tasks, request, None)
 
-    # Override upload_to_drive from form data if provided
-    if upload_to_drive is not None:
-        # Convert string 'true'/'false' to boolean
-        merge_data.upload_to_drive = upload_to_drive.lower() == "true"
-        logger.info(
-            f"Override upload_to_drive from form data: {merge_data.upload_to_drive}"
+
+@app.post("/merge-form")
+async def merge_videos_form(
+    background_tasks: BackgroundTasks,
+    video_urls: str = Form(...),
+    background_audio_url: str = Form(None),
+    background_volume: float = Form(0.5),
+    upload_to_drive: bool = Form(False),
+    subtitle_text: str = Form(None),
+    subtitle_font_size: int = Form(24),
+    subtitle_color: str = Form("white"),
+    narration_file: UploadFile = File(None),
+):
+    """Endpoint for form data requests with file uploads"""
+    # Convert form data to MergeVideoRequest object
+    try:
+        # Parse video_urls JSON string to list
+        video_urls_list = json.loads(video_urls)
+
+        # Create subtitle data dictionary
+        subtitle_data = {
+            "subtitle_text": subtitle_text,
+            "subtitle_font_size": subtitle_font_size,
+            "subtitle_color": subtitle_color,
+        }
+
+        # Create request object
+        request = MergeVideoRequest(
+            video_urls=video_urls_list,
+            background_audio_url=background_audio_url,
+            background_volume=background_volume,
+            upload_to_drive=upload_to_drive,
+            subtitle_data=subtitle_data,
         )
 
-    logger.info(f"Parsed merge data: {merge_data}")
+        return await process_merge_request(background_tasks, request, narration_file)
+    except json.JSONDecodeError:
+        return {"error": "Invalid JSON in video_urls"}
+
+
+async def process_merge_request(
+    background_tasks: BackgroundTasks,
+    request: MergeVideoRequest,
+    narration_file: UploadFile = None,
+):
+    logger.info("Merge endpoint accessed")
+    logger.info(f"Received request: {request}")
+
+    # Extract video URLs from the request
+    video_urls = request.video_urls
+    if not video_urls:
+        logger.error("No video URLs provided in the request")
+        return {"error": "No video URLs provided"}
+
+    # Get upload_to_drive parameter
+    upload_to_drive_bool = request.upload_to_drive
+
+    # Get background audio URL and volume
+    background_audio_url = request.background_audio_url
+    background_volume = request.background_volume
+
+    # Get subtitle data
+    subtitle_data = request.subtitle_data
+
+    logger.info(f"Using request data: {request}")
 
     # Create a unique ID for this request
     request_id = str(uuid.uuid4())
@@ -269,11 +412,9 @@ async def merge_videos(
     try:
         # Download videos
         video_paths = []
-        for i, video_url in enumerate(merge_data.video_urls):
+        for i, video_url in enumerate(video_urls):
             video_path = os.path.join(request_temp_dir, f"video_{i}.mp4")
-            logger.info(
-                f"Downloading video {i+1}/{len(merge_data.video_urls)} from {video_url}"
-            )
+            logger.info(f"Downloading video {i+1}/{len(video_urls)} from {video_url}")
             if download_file(video_url, video_path):
                 video_paths.append(video_path)
             else:
@@ -334,13 +475,11 @@ async def merge_videos(
         audio_tracks = []
 
         # Background audio
-        if merge_data.background_audio_url:
+        if background_audio_url:
             try:
                 bg_audio_path = os.path.join(request_temp_dir, "background.mp3")
-                logger.info(
-                    f"Downloading background audio from {merge_data.background_audio_url}"
-                )
-                if download_file(merge_data.background_audio_url, bg_audio_path):
+                logger.info(f"Downloading background audio from {background_audio_url}")
+                if download_file(background_audio_url, bg_audio_path):
                     # Verify audio file
                     if (
                         not os.path.exists(bg_audio_path)
@@ -376,13 +515,13 @@ async def merge_videos(
 
                     # Set volume for background audio
                     logger.info(
-                        f"Setting background audio volume to {merge_data.background_volume}"
+                        f"Setting background audio volume to {background_volume}"
                     )
-                    bg_audio = bg_audio.volumex(merge_data.background_volume)
+                    bg_audio = bg_audio.volumex(background_volume)
                     audio_tracks.append(bg_audio)
                 else:
                     logger.error(
-                        f"Failed to download background audio from {merge_data.background_audio_url}"
+                        f"Failed to download background audio from {background_audio_url}"
                     )
                     return {"error": "Failed to download background audio"}
             except Exception as e:
@@ -390,18 +529,61 @@ async def merge_videos(
                 return {"error": f"Error processing background audio: {str(e)}"}
 
         # Narration audio
+        have_narration = False
         if narration_file:
-            narration_path = os.path.join(request_temp_dir, "narration.mp3")
-            with open(narration_path, "wb") as buffer:
-                shutil.copyfileobj(narration_file.file, buffer)
+            try:
+                narration_path = os.path.join(request_temp_dir, "narration.mp3")
+                logger.info(f"Saving narration file to {narration_path}")
 
-            narration_audio = AudioFileClip(narration_path)
+                # Reset file cursor to beginning
+                await narration_file.seek(0)
 
-            # Trim narration if it's longer than the final video
-            if narration_audio.duration > final_clip.duration:
-                narration_audio = narration_audio.subclip(0, final_clip.duration)
+                # Save narration file
+                with open(narration_path, "wb") as buffer:
+                    shutil.copyfileobj(narration_file.file, buffer)
 
-            audio_tracks.append(narration_audio)
+                # Verify file exists and has content
+                if (
+                    os.path.exists(narration_path)
+                    and os.path.getsize(narration_path) > 0
+                ):
+                    try:
+                        logger.info(f"Loading narration audio from {narration_path}")
+                        narration_audio = AudioFileClip(narration_path)
+
+                        # Trim narration if it's longer than the final video
+                        if narration_audio.duration > final_clip.duration:
+                            logger.info(
+                                f"Trimming narration from {narration_audio.duration}s to {final_clip.duration}s"
+                            )
+                            narration_audio = narration_audio.subclip(
+                                0, final_clip.duration
+                            )
+
+                        audio_tracks.append(narration_audio)
+                        have_narration = True
+                    except Exception as inner_e:
+                        logger.error(
+                            f"Error processing narration audio: {str(inner_e)}"
+                        )
+                        # Don't use the narration file if we can't load it
+                        logger.warning(
+                            "Unable to use the narration file, continuing without narration"
+                        )
+                else:
+                    logger.warning(
+                        f"Narration file is missing or empty, skipping narration audio"
+                    )
+            except Exception as e:
+                logger.error(f"Error saving narration file: {str(e)}")
+                # Continue without narration rather than failing the whole process
+                logger.info("Continuing without narration audio")
+
+            # Log the outcome for clarity
+            if have_narration:
+                logger.info("Successfully added narration audio")
+            else:
+                logger.info("Proceeding without narration audio")
 
         # Combine audio tracks with video
         if audio_tracks:
@@ -423,22 +605,113 @@ async def merge_videos(
             )
             return {"error": "Output directory is not writable"}
 
+        # Writing video file
+        logger.info(
+            f"Writing final video to {output_path} with codec libx264 and audio codec aac"
+        )
+
+        # Generate output file path
+        temp_output_file_path = os.path.join(
+            request_temp_dir, f"temp_merged_video_{request_id}.mp4"
+        )
+        output_file_path = os.path.join(OUTPUT_DIR, f"merged_video_{request_id}.mp4")
+        logger.info(f"Writing merged video to {temp_output_file_path}")
+
         try:
+            # Write the result with optimized parameters to prevent broken pipe errors
             logger.info(
-                f"Writing final video to {output_path} with codec libx264 and audio codec aac"
+                "Writing video with optimized parameters to prevent broken pipe errors"
             )
-
-            # Add progress logging callback
-            def write_log(t):
-                logger.info(f"Writing video: {int(t*100)}% complete")
-
             final_clip.write_videofile(
-                output_path,
+                temp_output_file_path,
                 codec="libx264",
                 audio_codec="aac",
+                temp_audiofile=os.path.join(request_temp_dir, "temp_audio.m4a"),
+                remove_temp=True,
+                threads=1,  # Reduce to 1 thread to avoid resource competition
                 logger=None,
+                ffmpeg_params=["-preset", "ultrafast", "-bufsize", "2000k"],
                 verbose=False,
+                write_logfile=True,  # Write logs to help with debugging
             )
+            # Add subtitles if provided
+            if subtitle_data and subtitle_data.get("subtitle_text"):
+                logger.info(
+                    f"Adding subtitle text: {subtitle_data.get('subtitle_text')}"
+                )
+
+                # Create subtitle file (SRT format) with each line lasting 5 seconds
+                subtitle_path = os.path.join(request_temp_dir, "subtitle.srt")
+                subtitle_lines = subtitle_data.get("subtitle_text").split(".")
+                subtitle_lines = [
+                    line.strip() for line in subtitle_lines if line.strip()
+                ]
+
+                with open(subtitle_path, "w") as f:
+                    for i, line in enumerate(subtitle_lines):
+                        start_time = f"00:00:{i*5:02},000"
+                        end_time = f"00:00:{(i+1)*5:02},000"
+                        f.write(f"{i+1}\n{start_time} --> {end_time}\n{line}.\n\n")
+
+                # Use FFmpeg to add subtitles to the center of video
+                font_size = subtitle_data.get("subtitle_font_size", 24)
+                color = subtitle_data.get("subtitle_color", "white")
+
+                # FFmpeg command to add subtitles to center of video
+                import subprocess
+                import time
+
+                ffmpeg_cmd = [
+                    "ffmpeg",
+                    "-i",
+                    temp_output_file_path,
+                    "-vf",
+                    f"subtitles={subtitle_path}:force_style='FontSize={font_size},Alignment=10,PrimaryColour=&HFFFFFF'",
+                    "-c:a",
+                    "copy",
+                    "-preset",
+                    "ultrafast",  # Use ultrafast preset to reduce processing time
+                    "-bufsize",
+                    "2000k",  # Increase buffer size
+                    output_file_path,
+                    "-y",
+                ]
+                logger.info(f"Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
+
+                # Add retry mechanism for FFmpeg operations
+                max_retries = 3
+                retry_delay = 2  # seconds
+
+                for attempt in range(max_retries):
+                    try:
+                        logger.info(f"FFmpeg attempt {attempt+1}/{max_retries}")
+                        result = subprocess.run(
+                            ffmpeg_cmd, check=True, capture_output=True, text=True
+                        )
+                        logger.info("Successfully added subtitles to video")
+                        break
+                    except subprocess.CalledProcessError as e:
+                        logger.error(f"FFmpeg error on attempt {attempt+1}: {str(e)}")
+                        logger.error(f"FFmpeg stderr: {e.stderr}")
+
+                        if "Broken pipe" in e.stderr or "pipe:" in e.stderr:
+                            logger.warning(
+                                "Detected broken pipe error, will retry with different parameters"
+                            )
+                            # Modify command to use different parameters on retry
+                            ffmpeg_cmd.extend(["-max_muxing_queue_size", "9999"])
+
+                        if attempt < max_retries - 1:
+                            logger.info(f"Retrying in {retry_delay} seconds...")
+                            time.sleep(retry_delay)
+                            retry_delay *= 2  # Exponential backoff
+                        else:
+                            logger.error("All FFmpeg retry attempts failed")
+                            raise
+            else:
+                # If no subtitles, just copy the file to the output directory
+                shutil.copy(temp_output_file_path, output_file_path)
+
             logger.info(f"Successfully wrote video file to: {output_path}")
 
             # Verify file was created
@@ -494,7 +767,7 @@ async def merge_videos(
 
         # Upload to Google Drive if requested
         drive_upload_result = None
-        if merge_data.upload_to_drive:
+        if upload_to_drive_bool:
             try:
                 logger.info(f"Uploading video to Google Drive: {output_path}")
                 drive_upload_result = upload_video(output_path)
@@ -582,7 +855,7 @@ async def merge_videos(
                 logger.error(f"Error uploading to Google Drive: {str(e)}")
                 drive_upload_result = {"error": str(e)}
 
-            if merge_data.upload_to_drive:
+            if upload_to_drive_bool:
                 logger.info(
                     "Upload was requested, cleaning up all temp and output files"
                 )
@@ -593,31 +866,32 @@ async def merge_videos(
                 files_to_clean = [request_temp_dir, output_path]
                 if os.path.exists(permanent_output_path):
                     files_to_clean.append(permanent_output_path)
-                background_tasks.add_task(cleanup_files, files_to_clean)
-
-        return drive_upload_result
 
     except Exception as e:
-        # Clean up all files created during this request in case of error
         logger.error(f"Error in merge_videos: {str(e)}")
 
-        # Create a list of all files to clean up
+        # Create a list of files to clean up
         files_to_cleanup = [request_temp_dir]
 
-        # Add output path if it exists
+        # Add output files if they exist
         if "output_path" in locals() and os.path.exists(output_path):
             files_to_cleanup.append(output_path)
 
-        # Add permanent output path if it exists
         if "permanent_output_path" in locals() and os.path.exists(
             permanent_output_path
         ):
             files_to_cleanup.append(permanent_output_path)
 
-        # Clean up all files immediately, not as a background task
+        # Clean up all temporary files
         cleanup_files(files_to_cleanup)
 
-        return {"error": str(e)}
+        # Return a more user-friendly error message
+        if "narration.mp3" in str(e):
+            return {
+                "error": "There was an issue with the narration file. Please make sure it's a valid audio file."
+            }
+        else:
+            return {"error": str(e)}
 
 
 @app.get("/")
