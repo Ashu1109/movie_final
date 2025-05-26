@@ -3,6 +3,7 @@ import uuid
 import shutil
 import requests
 import logging
+import re
 from typing import List, Optional
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -96,8 +97,8 @@ def add_subtitle_to_video(video_path, request_temp_dir, merge_data):
 
     with open(subtitle_file, "w") as f:
         for i, subtitle in enumerate(subtitles):
-            start_time = f"00:00:{i*5:02},000"
-            end_time = f"00:00:{(i+1)*5:02},000"
+            start_time = f"00:00:{i*4:02},000"
+            end_time = f"00:00:{(i+1)*4:02},000"
             f.write(f"{i+1}\n{start_time} --> {end_time}\n{subtitle}\n\n")
 
     # Add subtitle to video using FFmpeg
@@ -109,7 +110,7 @@ def add_subtitle_to_video(video_path, request_temp_dir, merge_data):
         "-i",
         video_path,
         "-vf",
-        f"subtitles={subtitle_file}:force_style='Fontsize={merge_data['subtitle_font_size']},Alignment=10,PrimaryColour=&HFFFFFF,Outline=1,Shadow=0,MarginV=0,MarginL=0,MarginR=0,Bold=1'",
+        f"subtitles={subtitle_file}:force_style='Fontsize={merge_data['subtitle_font_size']},Alignment=10,PrimaryColour=&H80FFFFFF,Shadow=0,MarginV=0,MarginL=0,MarginR=0,Bold=1'",
         "-c:v",
         "libx264",
         output_video_with_subtitle,
@@ -132,6 +133,112 @@ class MergeRequest(BaseModel):
     subtitle_text: Optional[str] = None
     subtitle_font_size: Optional[int] = 24
     subtitle_color: Optional[str] = "white"
+
+
+def extract_drive_file_id(url):
+    """Extract file ID from Google Drive URL"""
+    logger.info(f"Extracting Drive file ID from URL: {url}")
+
+    # Simple pattern for extracting ID from /file/d/{id}/ format
+    simple_pattern = r"/file/d/([\w-]+)"
+    simple_match = re.search(simple_pattern, url)
+    if simple_match:
+        file_id = simple_match.group(1)
+        logger.info(f"Found file ID using simple pattern: {file_id}")
+        return file_id
+
+    # Pattern for https://drive.google.com/file/d/{fileid}/view
+    file_id_match = re.search(r"drive\.google\.com/file/d/([^/]+)", url) or re.search(
+        r"drive.google.com/file/d/([^/]+)", url
+    )
+    if file_id_match:
+        file_id = file_id_match.group(1)
+        logger.info(f"Found file ID using drive pattern: {file_id}")
+        return file_id
+
+    # Pattern for https://docs.google.com/document/d/{fileid}/edit
+    docs_match = re.search(r"docs\.google\.com/\w+/d/([^/]+)", url) or re.search(
+        r"docs.google.com/\w+/d/([^/]+)", url
+    )
+    if docs_match:
+        file_id = docs_match.group(1)
+        logger.info(f"Found file ID using docs pattern: {file_id}")
+        return file_id
+
+    # Direct file ID
+    if re.match(r"^[A-Za-z0-9_-]{25,}$", url):
+        logger.info(f"URL appears to be a direct file ID: {url}")
+        return url
+
+    logger.error(f"Could not extract file ID from URL: {url}")
+    return None
+
+
+def download_drive_file(url, output_path):
+    """Download a file from Google Drive"""
+    try:
+        file_id = extract_drive_file_id(url)
+        if not file_id:
+            logger.error(f"Could not extract file ID from Google Drive URL: {url}")
+            return False
+
+        # Construct direct download URL
+        download_url = f"https://drive.google.com/uc?id={file_id}&export=download"
+        logger.info(
+            f"Downloading Google Drive file with ID {file_id} from {download_url}"
+        )
+
+        # First request to get the confirmation token for large files
+        session = requests.Session()
+        response = session.get(download_url, stream=True, timeout=30)
+        response.raise_for_status()
+
+        # Check if this is a large file that requires confirmation
+        for key, value in response.cookies.items():
+            if key.startswith("download_warning"):
+                logger.info("Large file detected, adding confirmation parameter")
+                # Add confirmation parameter
+                download_url = f"{download_url}&confirm={value}"
+                break
+
+        logger.info(f"Final download URL: {download_url}")
+
+        # Download the file
+        with open(output_path, "wb") as f:
+            response = session.get(download_url, stream=True, timeout=30)
+            response.raise_for_status()
+
+            # Check content type to make sure we're getting a file and not an HTML page
+            content_type = response.headers.get("Content-Type", "")
+            if "html" in content_type.lower() and not content_type.startswith(
+                ("audio", "video", "application")
+            ):
+                logger.error(
+                    f"Received HTML content instead of file. Content-Type: {content_type}"
+                )
+                return False
+
+            # Download the file in chunks
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+        # Verify file was downloaded successfully
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            logger.info(
+                f"Successfully downloaded Google Drive file to {output_path} ({os.path.getsize(output_path)} bytes)"
+            )
+            return True
+        else:
+            logger.error(f"Downloaded file is empty or does not exist: {output_path}")
+            return False
+
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Request error when downloading Google Drive file: {str(e)}")
+        return False
+    except Exception as e:
+        logger.error(f"Error downloading Google Drive file: {str(e)}")
+        return False
 
 
 def download_file(url, output_path):
@@ -344,7 +451,7 @@ async def merge_videos_form(
     subtitle_text: str = Form(None),
     subtitle_font_size: int = Form(24),
     subtitle_color: str = Form("white"),
-    narration_file: UploadFile = File(None),
+    narration_file: str = Form(None),
 ):
     """Endpoint for form data requests with file uploads"""
     # Convert form data to MergeVideoRequest object
@@ -376,7 +483,8 @@ async def merge_videos_form(
 async def process_merge_request(
     background_tasks: BackgroundTasks,
     request: MergeVideoRequest,
-    narration_file: UploadFile = None,
+    narration_file: str = None,
+    narration_url: str = None,
 ):
     logger.info("Merge endpoint accessed")
     logger.info(f"Received request: {request}")
@@ -530,54 +638,108 @@ async def process_merge_request(
 
         # Narration audio
         have_narration = False
+        narration_path = os.path.join(request_temp_dir, "narration.mp3")
+        narration_ready = False
+
+        # Handle narration input - could be a file object or a string URL
         if narration_file:
-            try:
-                narration_path = os.path.join(request_temp_dir, "narration.mp3")
-                logger.info(f"Saving narration file to {narration_path}")
+            # Check if narration_file is a string (URL) or file object
+            if isinstance(narration_file, str):
+                # It's a URL, treat it as narration_url
+                logger.info(f"Treating narration_file as URL: {narration_file}")
+                try:
+                    # Check if it's a Google Drive URL
+                    if (
+                        "drive.google.com" in narration_file
+                        or "docs.google.com" in narration_file
+                    ):
+                        download_success = download_drive_file(
+                            narration_file, narration_path
+                        )
+                    else:
+                        download_success = download_file(narration_file, narration_path)
 
-                # Reset file cursor to beginning
-                await narration_file.seek(0)
-
-                # Save narration file
-                with open(narration_path, "wb") as buffer:
-                    shutil.copyfileobj(narration_file.file, buffer)
-
-                # Verify file exists and has content
-                if (
-                    os.path.exists(narration_path)
-                    and os.path.getsize(narration_path) > 0
-                ):
-                    try:
-                        logger.info(f"Loading narration audio from {narration_path}")
-                        narration_audio = AudioFileClip(narration_path)
-
-                        # Trim narration if it's longer than the final video
-                        if narration_audio.duration > final_clip.duration:
-                            logger.info(
-                                f"Trimming narration from {narration_audio.duration}s to {final_clip.duration}s"
-                            )
-                            narration_audio = narration_audio.subclip(
-                                0, final_clip.duration
-                            )
-
-                        audio_tracks.append(narration_audio)
-                        have_narration = True
-                    except Exception as inner_e:
+                    narration_ready = download_success
+                    if not download_success:
                         logger.error(
-                            f"Error processing narration audio: {str(inner_e)}"
+                            f"Failed to download narration file from {narration_file}"
                         )
-                        # Don't use the narration file if we can't load it
-                        logger.warning(
-                            "Unable to use the narration file, continuing without narration"
-                        )
-                else:
-                    logger.warning(
-                        f"Narration file is missing or empty, skipping narration audio"
+                        logger.info("Continuing without narration audio")
+                except Exception as e:
+                    logger.error(f"Error downloading narration file: {str(e)}")
+                    logger.info("Continuing without narration audio")
+            else:
+                # It's a file object
+                try:
+                    logger.info(f"Saving uploaded narration file to {narration_path}")
+                    # Reset file cursor to beginning
+                    await narration_file.seek(0)
+                    # Save narration file
+                    with open(narration_path, "wb") as buffer:
+                        shutil.copyfileobj(narration_file.file, buffer)
+
+                    narration_ready = True
+                except Exception as e:
+                    logger.error(f"Error saving uploaded narration file: {str(e)}")
+                    logger.info("Continuing without narration audio")
+
+        # Handle narration from separate URL parameter (for backward compatibility)
+        elif narration_url:
+            # Use the same URL handling code by treating narration_url as narration_file
+            logger.info(
+                f"Processing narration from narration_url parameter: {narration_url}"
+            )
+            try:
+                # Check if it's a Google Drive URL
+                if (
+                    "drive.google.com" in narration_url
+                    or "docs.google.com" in narration_url
+                ):
+                    download_success = download_drive_file(
+                        narration_url, narration_path
                     )
+                else:
+                    download_success = download_file(narration_url, narration_path)
+
+                narration_ready = download_success
+                if not download_success:
+                    logger.error(
+                        f"Failed to download narration file from {narration_url}"
+                    )
+                    logger.info("Continuing without narration audio")
             except Exception as e:
-                logger.error(f"Error saving narration file: {str(e)}")
-                # Continue without narration rather than failing the whole process
+                logger.error(f"Error downloading narration file: {str(e)}")
                 logger.info("Continuing without narration audio")
+
+        # Process narration file if it was successfully obtained
+        if narration_ready:
+            # Verify file exists and has content
+            if os.path.exists(narration_path) and os.path.getsize(narration_path) > 0:
+                try:
+                    logger.info(f"Loading narration audio from {narration_path}")
+                    narration_audio = AudioFileClip(narration_path)
+
+                    # Trim narration if it's longer than the final video
+                    if narration_audio.duration > final_clip.duration:
+                        logger.info(
+                            f"Trimming narration from {narration_audio.duration}s to {final_clip.duration}s"
+                        )
+                        narration_audio = narration_audio.subclip(
+                            0, final_clip.duration
+                        )
+
+                    audio_tracks.append(narration_audio)
+                    have_narration = True
+                except Exception as inner_e:
+                    logger.error(f"Error processing narration audio: {str(inner_e)}")
+                    # Don't use the narration file if we can't load it
+                    logger.warning(
+                        "Unable to use the narration file, continuing without narration"
+                    )
+            else:
+                logger.warning(
+                    f"Narration file is missing or empty, skipping narration audio"
+                )
 
             # Log the outcome for clarity
             if have_narration:
