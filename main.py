@@ -649,8 +649,8 @@ async def process_merge_request(
 
                 with open(subtitle_path, "w") as f:
                     for i, line in enumerate(subtitle_lines):
-                        start_time = f"00:00:{i*5:02},000"
-                        end_time = f"00:00:{(i+1)*5:02},000"
+                        start_time = f"00:00:{i*4:02},000"
+                        end_time = f"00:00:{(i+1)*4:02},000"
                         f.write(f"{i+1}\n{start_time} --> {end_time}\n{line}.\n\n")
 
                 # Use FFmpeg to add subtitles to the center of video
@@ -892,6 +892,7 @@ async def process_merge_request(
             }
         else:
             return {"error": str(e)}
+    return {"message": drive_upload_result}
 
 
 @app.get("/")
