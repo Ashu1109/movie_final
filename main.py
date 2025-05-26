@@ -110,7 +110,7 @@ def add_subtitle_to_video(video_path, request_temp_dir, merge_data):
         "-i",
         video_path,
         "-vf",
-        f"subtitles={subtitle_file}:force_style='Fontsize={merge_data['subtitle_font_size']},Alignment=10,PrimaryColour=&H80FFFFFF,Shadow=0,MarginV=0,MarginL=0,MarginR=0,Bold=1'",
+        f"subtitles={subtitle_file}:force_style='FontName=Montserrat SemiBold,Fontsize={merge_data['subtitle_font_size']},Alignment=10,PrimaryColour=&H80FFFFFF,BorderStyle=0.5,OutlineColour=&H00000000,Shadow=1,ShadowColour=&H20000000,MarginV=0,MarginL=0,MarginR=0,Bold=0'",
         "-c:v",
         "libx264",
         output_video_with_subtitle,
@@ -146,7 +146,7 @@ def extract_drive_file_id(url):
         file_id = simple_match.group(1)
         logger.info(f"Found file ID using simple pattern: {file_id}")
         return file_id
-        
+
     # Pattern for direct download URLs: https://drive.google.com/uc?id={fileid}&export=download
     direct_pattern = r"[?&]id=([\w-]+)"
     direct_match = re.search(direct_pattern, url)
