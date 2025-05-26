@@ -146,6 +146,14 @@ def extract_drive_file_id(url):
         file_id = simple_match.group(1)
         logger.info(f"Found file ID using simple pattern: {file_id}")
         return file_id
+        
+    # Pattern for direct download URLs: https://drive.google.com/uc?id={fileid}&export=download
+    direct_pattern = r"[?&]id=([\w-]+)"
+    direct_match = re.search(direct_pattern, url)
+    if direct_match:
+        file_id = direct_match.group(1)
+        logger.info(f"Found file ID from direct download URL: {file_id}")
+        return file_id
 
     # Pattern for https://drive.google.com/file/d/{fileid}/view
     file_id_match = re.search(r"drive\.google\.com/file/d/([^/]+)", url) or re.search(
