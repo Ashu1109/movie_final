@@ -11,7 +11,6 @@ RUN apt-get update && apt-get install -y \
 # Copy requirements file
 COPY requirements.txt .
 
-COPY . .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
@@ -26,6 +25,7 @@ COPY service_account.json ./
 # Set environment variables
 ENV PYTHONUNBUFFERED=1
 
+COPY . .
 # Expose port
 EXPOSE 8001
 

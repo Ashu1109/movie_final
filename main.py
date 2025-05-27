@@ -16,6 +16,7 @@ from moviepy.editor import (
     concatenate_videoclips,
     CompositeAudioClip,
 )
+import requests
 from upload_google import upload_video
 
 
@@ -51,7 +52,7 @@ import os
 import subprocess
 
 
-def add_subtitle_to_video(video_path, request_temp_dir, merge_data):
+def add_subtitle_to_video(video_path, request_temp_dir, audio_path):
     """
     Add subtitle to a video using FFmpeg.
 
@@ -70,36 +71,94 @@ def add_subtitle_to_video(video_path, request_temp_dir, merge_data):
     if not os.path.exists(request_temp_dir):
         os.makedirs(request_temp_dir)
 
+    files = {"myfile": open(audio_path, "rb")}
+    data = {
+        "params": json.dumps(
+            {
+                "template_id": "c793ad80c401438eb9c33b2ac2df058e",
+                "auth": {"key": "9b6f2d174f9240a58553008c2e047259"},
+            }
+        )
+    }
+
+    response = requests.post(
+        "https://api2.transloadit.com/assemblies", files=files, data=data
+    )
+    if response.status_code == 200:
+        print("API call successful:", response.json())
+
+    import time
+
+    assembly_ssl_url = response.json().get("assembly_ssl_url")
+    if assembly_ssl_url:
+        while True:
+            poll_response = requests.get(assembly_ssl_url)
+            poll_data = poll_response.json()
+            if (
+                poll_data.get("ok") == "ASSEMBLY_COMPLETED"
+                and poll_response.status_code == 200
+            ):
+                print("The Assembly was successfully completed.", poll_response)
+                # Extract the SRT file URL from the assembly result
+                transcribed_results = poll_data.get("results", {}).get(
+                    "transcribed", []
+                )
+                srt_url = None
+                if transcribed_results and len(transcribed_results) > 0:
+                    srt_url = transcribed_results[0].get("ssl_url")
+
+                # Download the SRT file if the URL is available
+                if srt_url:
+                    srt_response = requests.get(srt_url)
+                    if srt_response.status_code == 200:
+                        srt_path = os.path.join(request_temp_dir, "subtitle.srt")
+                        with open(srt_path, "wb") as srt_file:
+                            srt_file.write(srt_response.content)
+                        print("Downloaded SRT file successfully:", srt_path)
+                    else:
+                        print(
+                            "Failed to download SRT file, HTTP status:",
+                            srt_response.status_code,
+                        )
+                else:
+                    print("No SRT URL found in the assembly result.")
+                break
+            else:
+                print("Polling for assembly completion...")
+                time.sleep(5)  # Poll every 5 seconds
+    else:
+        print("No assembly URL found in the response.")
+
     subtitle_file = os.path.join(request_temp_dir, "subtitle.srt")
 
-    # Create SRT file with subtitles, breaking the subtitle_text into parts
-    if "subtitle_text" in merge_data and merge_data["subtitle_text"]:
-        # Split the subtitle_text by periods to create separate sentences
-        raw_subtitles = merge_data["subtitle_text"].split(".")
-        # Clean up the sentences and remove empty ones
-        subtitles = [subtitle.strip() for subtitle in raw_subtitles if subtitle.strip()]
-        # Add periods back to the end of each subtitle if not already present
-        subtitles = [
-            subtitle + "." if not subtitle.endswith(".") else subtitle
-            for subtitle in subtitles
-        ]
-    else:
-        # Fallback to default subtitles if no subtitle_text is provided
-        subtitles = [
-            "Embark on a journey of timeless wisdom.",
-            "From ancient Greece to modern life.",
-            "In the shadow of Titans, we discover eternal truths etched in marble.",
-            "Through ancient eyes, we see the present anew, a canvas of choices and change.",
-            "The gods whisper through marble, guiding us toward unyielding resolve amid chaos.",
-            "In contemplation, find the courage to act; in action, find the peace of mind.",
-            "These lessons endure as marble, teaching us strength, patience, and enduring wisdom.",
-        ]
+    # # Create SRT file with subtitles, breaking the subtitle_text into parts
+    # if "subtitle_text" in merge_data and merge_data["subtitle_text"]:
+    #     # Split the subtitle_text by periods to create separate sentences
+    #     raw_subtitles = merge_data["subtitle_text"].split(".")
+    #     # Clean up the sentences and remove empty ones
+    #     subtitles = [subtitle.strip() for subtitle in raw_subtitles if subtitle.strip()]
+    #     # Add periods back to the end of each subtitle if not already present
+    #     subtitles = [
+    #         subtitle + "." if not subtitle.endswith(".") else subtitle
+    #         for subtitle in subtitles
+    #     ]
+    # else:
+    #     # Fallback to default subtitles if no subtitle_text is provided
+    #     subtitles = [
+    #         "Embark on a journey of timeless wisdom.",
+    #         "From ancient Greece to modern life.",
+    #         "In the shadow of Titans, we discover eternal truths etched in marble.",
+    #         "Through ancient eyes, we see the present anew, a canvas of choices and change.",
+    #         "The gods whisper through marble, guiding us toward unyielding resolve amid chaos.",
+    #         "In contemplation, find the courage to act; in action, find the peace of mind.",
+    #         "These lessons endure as marble, teaching us strength, patience, and enduring wisdom.",
+    #     ]
 
-    with open(subtitle_file, "w") as f:
-        for i, subtitle in enumerate(subtitles):
-            start_time = f"00:00:{i*4:02},000"
-            end_time = f"00:00:{(i+1)*4:02},000"
-            f.write(f"{i+1}\n{start_time} --> {end_time}\n{subtitle}\n\n")
+    # with open(subtitle_file, "w") as f:
+    #     for i, subtitle in enumerate(subtitles):
+    #         start_time = f"00:00:{i*4:02},000"
+    #         end_time = f"00:00:{(i+1)*4:02},000"
+    #         f.write(f"{i+1}\n{start_time} --> {end_time}\n{subtitle}\n\n")
 
     # Add subtitle to video using FFmpeg
     output_video_with_subtitle = os.path.join(
@@ -792,11 +851,13 @@ async def process_merge_request(
             logger.info(
                 "Writing video with optimized parameters to prevent broken pipe errors"
             )
+            # Ensure temp_audiofile is a string path, not an AudioFileClip object
+            temp_audio_path = os.path.join(request_temp_dir, "temp_audio.m4a")
             final_clip.write_videofile(
                 temp_output_file_path,
                 codec="libx264",
                 audio_codec="aac",
-                temp_audiofile=os.path.join(request_temp_dir, "temp_audio.m4a"),
+                temp_audiofile=temp_audio_path,
                 remove_temp=True,
                 threads=1,  # Reduce to 1 thread to avoid resource competition
                 logger=None,
@@ -810,22 +871,70 @@ async def process_merge_request(
                     f"Adding subtitle text: {subtitle_data.get('subtitle_text')}"
                 )
 
-                # Create subtitle file (SRT format) with each line lasting 5 seconds
-                subtitle_path = os.path.join(request_temp_dir, "subtitle.srt")
-                subtitle_lines = subtitle_data.get("subtitle_text").split(".")
-                subtitle_lines = [
-                    line.strip() for line in subtitle_lines if line.strip()
-                ]
+                files = {"myfile": open(narration_path, "rb")}
+                data = {
+                    "params": json.dumps(
+                        {
+                            "template_id": "c793ad80c401438eb9c33b2ac2df058e",
+                            "auth": {"key": "9b6f2d174f9240a58553008c2e047259"},
+                        }
+                    )
+                }
 
-                with open(subtitle_path, "w") as f:
-                    for i, line in enumerate(subtitle_lines):
-                        start_time = f"00:00:{i*4:02},000"
-                        end_time = f"00:00:{(i+1)*4:02},000"
-                        f.write(f"{i+1}\n{start_time} --> {end_time}\n{line}.\n\n")
+                response = requests.post(
+                    "https://api2.transloadit.com/assemblies", files=files, data=data
+                )
+                if response.status_code == 200:
+                    print("API call successful:", response.json())
 
-                # Use FFmpeg to add subtitles to the center of video
-                font_size = subtitle_data.get("subtitle_font_size", 24)
-                color = subtitle_data.get("subtitle_color", "white")
+                import time
+
+                assembly_ssl_url = response.json().get("assembly_ssl_url")
+                if assembly_ssl_url:
+                    while True:
+                        poll_response = requests.get(assembly_ssl_url)
+                        poll_data = poll_response.json()
+                        if (
+                            poll_data.get("ok") == "ASSEMBLY_COMPLETED"
+                            and poll_response.status_code == 200
+                        ):
+                            print(
+                                "The Assembly was successfully completed.",
+                                poll_response,
+                            )
+                            # Extract the SRT file URL from the assembly result
+                            transcribed_results = poll_data.get("results", {}).get(
+                                "transcribed", []
+                            )
+                            srt_url = None
+                            if transcribed_results and len(transcribed_results) > 0:
+                                srt_url = transcribed_results[0].get("ssl_url")
+
+                            # Download the SRT file if the URL is available
+                            if srt_url:
+                                srt_response = requests.get(srt_url)
+                                if srt_response.status_code == 200:
+                                    srt_path = os.path.join(
+                                        request_temp_dir, "subtitle.srt"
+                                    )
+                                    with open(srt_path, "wb") as srt_file:
+                                        srt_file.write(srt_response.content)
+                                    print("Downloaded SRT file successfully:", srt_path)
+                                else:
+                                    print(
+                                        "Failed to download SRT file, HTTP status:",
+                                        srt_response.status_code,
+                                    )
+                            else:
+                                print("No SRT URL found in the assembly result.")
+                            break
+                        else:
+                            print("Polling for assembly completion...")
+                            time.sleep(5)  # Poll every 5 seconds
+                else:
+                    print("No assembly URL found in the response.")
+
+                subtitle_file = os.path.join(request_temp_dir, "subtitle.srt")
 
                 # FFmpeg command to add subtitles to center of video
                 import subprocess
@@ -836,16 +945,17 @@ async def process_merge_request(
                     "-i",
                     temp_output_file_path,
                     "-vf",
-                    f"subtitles={subtitle_path}:force_style='FontSize={font_size},Alignment=10,PrimaryColour=&HFFFFFF'",
+                    f"subtitles={subtitle_file}:force_style='FontName=Montserrat SemiBold,Fontsize=24,Alignment=10,PrimaryColour=&H00FFFFFF,Outline=1,OutlineColour=&H00000000,Shadow=0,Bold=1,MarginV=40'",
                     "-c:a",
                     "copy",
                     "-preset",
-                    "ultrafast",  # Use ultrafast preset to reduce processing time
+                    "ultrafast",
                     "-bufsize",
-                    "2000k",  # Increase buffer size
+                    "2000k",
                     output_file_path,
                     "-y",
                 ]
+
                 logger.info(f"Running FFmpeg command: {' '.join(ffmpeg_cmd)}")
 
                 # Add retry mechanism for FFmpeg operations
