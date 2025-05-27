@@ -75,8 +75,8 @@ def add_subtitle_to_video(video_path, request_temp_dir, audio_path):
     data = {
         "params": json.dumps(
             {
-                "template_id": "c793ad80c401438eb9c33b2ac2df058e",
-                "auth": {"key": "9b6f2d174f9240a58553008c2e047259"},
+                "template_id": "23fec5329d9b49beb5f1d4bb26b367c2",
+                "auth": {"key": "1248e507bec74296933469de5a477ee2"},
             }
         )
     }
@@ -124,8 +124,8 @@ def add_subtitle_to_video(video_path, request_temp_dir, audio_path):
                     print("No SRT URL found in the assembly result.")
                 break
             else:
-                print("Polling for assembly completion...")
-                time.sleep(5)  # Poll every 5 seconds
+                print(f"Polling for assembly completion...", poll_data)
+                time.sleep(10)  # Poll every 5 seconds
     else:
         print("No assembly URL found in the response.")
 
@@ -871,6 +871,88 @@ async def process_merge_request(
                     f"Adding subtitle text: {subtitle_data.get('subtitle_text')}"
                 )
 
+                # Check audio duration with ffprobe and pad if needed (AWS requires min 0.5s)
+                try:
+                    # Get audio duration with ffprobe
+                    import subprocess
+
+                    duration_cmd = [
+                        "ffprobe",
+                        "-v",
+                        "error",
+                        "-show_entries",
+                        "format=duration",
+                        "-of",
+                        "default=noprint_wrappers=1:nokey=1",
+                        narration_path,
+                    ]
+                    duration_result = subprocess.run(
+                        duration_cmd, capture_output=True, text=True, check=True
+                    )
+                    audio_duration = float(duration_result.stdout.strip())
+                    logger.info(f"Audio duration: {audio_duration} seconds")
+
+                    # If audio is shorter than 0.5 seconds, pad it
+                    if audio_duration < 0.5:
+                        logger.warning(
+                            f"Audio too short: {audio_duration}s. Adding silence to meet 0.5s minimum."
+                        )
+                        padded_path = os.path.join(
+                            request_temp_dir, "padded_narration.mp3"
+                        )
+
+                        # Create silence and concatenate
+                        padding_needed = (
+                            0.55 - audio_duration
+                        )  # Add extra padding to be safe
+                        silence_path = os.path.join(request_temp_dir, "silence.mp3")
+
+                        # Create silence file
+                        silence_cmd = [
+                            "ffmpeg",
+                            "-f",
+                            "lavfi",
+                            "-i",
+                            "anullsrc=r=44100:cl=mono",
+                            "-t",
+                            str(padding_needed),
+                            "-q:a",
+                            "0",
+                            "-c:a",
+                            "libmp3lame",
+                            silence_path,
+                            "-y",
+                        ]
+                        subprocess.run(silence_cmd, check=True, capture_output=True)
+
+                        # Create concat file
+                        concat_file = os.path.join(request_temp_dir, "concat.txt")
+                        with open(concat_file, "w") as f:
+                            f.write(f"file '{narration_path}'\nfile '{silence_path}'")
+
+                        # Concatenate files
+                        concat_cmd = [
+                            "ffmpeg",
+                            "-f",
+                            "concat",
+                            "-safe",
+                            "0",
+                            "-i",
+                            concat_file,
+                            "-c",
+                            "copy",
+                            padded_path,
+                            "-y",
+                        ]
+                        subprocess.run(concat_cmd, check=True, capture_output=True)
+
+                        # Use padded file instead
+                        narration_path = padded_path
+                        logger.info(f"Using padded audio: {narration_path}")
+                except Exception as e:
+                    logger.warning(f"Error checking/padding audio: {str(e)}")
+                    # Continue with original file if padding fails
+
                 files = {"myfile": open(narration_path, "rb")}
                 data = {
                     "params": json.dumps(
@@ -929,8 +1011,8 @@ async def process_merge_request(
                                 print("No SRT URL found in the assembly result.")
                             break
                         else:
-                            print("Polling for assembly completion...")
-                            time.sleep(5)  # Poll every 5 seconds
+                            print(f"Polling for assembly completion...", poll_data)
+                            time.sleep(10)  # Poll every 10 seconds
                 else:
                     print("No assembly URL found in the response.")
 
@@ -945,7 +1027,7 @@ async def process_merge_request(
                     "-i",
                     temp_output_file_path,
                     "-vf",
-                    f"subtitles={subtitle_file}:force_style='FontName=Montserrat SemiBold,Fontsize=24,Alignment=10,PrimaryColour=&H00FFFFFF,Outline=1,OutlineColour=&H00000000,Shadow=0,Bold=1,MarginV=40'",
+                    f"subtitles={subtitle_file}:force_style='FontName=Montserrat SemiBold,Fontsize=20,Alignment=10,PrimaryColour=&H00FFFFFF,Outline=0,OutlineColour=&H00000000,Shadow=1,Bold=1,MarginV=40'",
                     "-c:a",
                     "copy",
                     "-preset",
